@@ -8,6 +8,7 @@ import zipfile
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import pandas as pd
 import requests
@@ -147,7 +148,7 @@ def baixar_zip_caixa(url, tentativas=2, espera_inicial=3):
 def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
   nome_arquivo = os.path.basename(caminho_local)
   media = MediaFileUpload(
-      caminho_local, mimetype="application/json", resumable=True
+      caminho_local, mimetype="application/json", resumable=False
   )
 
   query = (
@@ -179,29 +180,37 @@ def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
         )
         .execute()
     )
-    print(f"Atualizado no Drive: {atualizado['name']}")
+    print(f"Atualizado no Drive com sucesso: {atualizado['name']}")
   else:
-    metadata = {"name": nome_arquivo, "parents": [folder_id]}
-    criado = (
-        service.files()
-        .create(
-            body=metadata,
-            media_body=media,
-            fields="id, name",
-            supportsAllDrives=True,
-        )
-        .execute()
-    )
-    print(f"Enviado para o Drive: {criado['name']}")
+    try:
+      metadata = {"name": nome_arquivo, "parents": [folder_id]}
+      criado = (
+          service.files()
+          .create(
+              body=metadata,
+              media_body=media,
+              fields="id, name",
+              supportsAllDrives=True,
+          )
+          .execute()
+      )
+      print(f"Criado no Drive: {criado['name']}")
+    except HttpError as e:
+      if "storageQuotaExceeded" in str(e):
+        raise RuntimeError(
+            f"O arquivo '{nome_arquivo}' ainda não existe na pasta do Drive. "
+            "Como Contas de Serviço não têm cota própria, crie um arquivo "
+            f"vazio chamado '{nome_arquivo}' na pasta 01_BASE_SINAPI_JSON "
+            "para que o robô possa atualizá-lo."
+        ) from e
+      raise
 
 
 def encontrar_indice_preco(df_raw, header_idx, headers_norm, uf):
-  # 1. Procura coluna cujo cabeçalho seja exatamente a UF (ex.: "RJ")
   for i, h in enumerate(headers_norm):
     if h == uf:
       return i
 
-  # 2. Procura coluna onde a linha de cabeçalho ou até 3 linhas acima contenham a UF
   for i, h in enumerate(headers_norm):
     if "ORIGEM" in h:
       continue
@@ -213,7 +222,6 @@ def encontrar_indice_preco(df_raw, header_idx, headers_norm, uf):
         if acima == uf or re.search(rf"\b{re.escape(uf)}\b", acima):
           return i
 
-  # 3. Fallback: primeira coluna numérica de preço/custo (ignorando "ORIGEM")
   for i, h in enumerate(headers_norm):
     if "ORIGEM" in h:
       continue
@@ -224,8 +232,6 @@ def encontrar_indice_preco(df_raw, header_idx, headers_norm, uf):
 
 
 def aba_corresponde_regime(aba_norm, desonerado):
-  # Abas padrão da Caixa: ISD (Insumo Sem Deson.), ICD (Insumo Com Deson.),
-  # CSD (Composição Sem Deson.), CCD (Composição Com Deson.)
   if "ANALITICO" in aba_norm:
     return False
   if desonerado:
@@ -371,7 +377,12 @@ def processar_e_enviar():
       if not nome_arq.endswith((".xlsx", ".xls")):
         continue
 
-      print(f"Lendo planilha dentro do ZIP: {nome_arq}")
+      # Foca apenas na planilha SINAPI_Referência (preços de insumos e composições)
+      if "REFER" not in normalizar_texto(nome_arq):
+        print(f"Ignorando planilha auxiliar: {nome_arq}")
+        continue
+
+      print(f"Lendo planilha principal: {nome_arq}")
       with z.open(nome_arq) as f:
         abas_extraidas = extrair_abas_de_planilha(
             io.BytesIO(f.read()), uf, desonerado
