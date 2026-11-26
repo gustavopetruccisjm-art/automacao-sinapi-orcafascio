@@ -14,9 +14,11 @@ import requests
 
 
 def normalizar_texto(texto):
-  if pd.isna(texto):
+  if texto is None or (isinstance(texto, float) and pd.isna(texto)):
     return ""
   texto = str(texto).strip().upper()
+  if texto in ("NAN", "NONE", "NAT"):
+    return ""
   texto = (
       unicodedata.normalize("NFKD", texto)
       .encode("ASCII", "ignore")
@@ -26,11 +28,15 @@ def normalizar_texto(texto):
 
 
 def limpar_valor(val):
-  if pd.isna(val):
+  if isinstance(val, pd.Series):
+    val = val.iloc[0] if not val.empty else 0.0
+  if val is None or (isinstance(val, float) and pd.isna(val)):
     return 0.0
   if isinstance(val, (int, float)):
     return float(val)
   s = str(val).replace("R$", "").replace(".", "").replace(",", ".").strip()
+  if not s or s in ("-", "—", "N/A", "NAN", "NONE"):
+    return 0.0
   try:
     return float(s)
   except ValueError:
@@ -69,10 +75,15 @@ def localizar_e_baixar_zip(service, folder_id, ano_mes):
   )
 
   todos_arquivos = res.get("files", [])
-  print("Arquivos encontrados na pasta do Drive:", [a["name"] for a in todos_arquivos])
+  print(
+      "Arquivos encontrados na pasta do Drive:",
+      [a["name"] for a in todos_arquivos],
+  )
 
   arquivos_zip = [
-      a for a in todos_arquivos if str(a.get("name", "")).lower().endswith(".zip")
+      a
+      for a in todos_arquivos
+      if str(a.get("name", "")).lower().endswith(".zip")
   ]
 
   escolhido = None
@@ -97,8 +108,7 @@ def localizar_e_baixar_zip(service, folder_id, ano_mes):
   if not escolhido:
     raise FileNotFoundError(
         f"Nenhum arquivo .zip encontrado na pasta do Drive (esperado algo"
-        f" como {nome_padrao}). Envie o .zip para a pasta 01_BASE_SINAPI_JSON"
-        " antes de rodar."
+        f" como {nome_padrao})."
     )
 
   print(f"ZIP localizado no Drive: {escolhido['name']}")
@@ -185,18 +195,67 @@ def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
     print(f"Enviado para o Drive: {criado['name']}")
 
 
-def extrair_registros_de_planilha(file_obj, uf):
+def encontrar_indice_preco(df_raw, header_idx, headers_norm, uf):
+  # 1. Procura coluna cujo cabeçalho seja exatamente a UF (ex.: "RJ")
+  for i, h in enumerate(headers_norm):
+    if h == uf:
+      return i
+
+  # 2. Procura coluna onde a linha de cabeçalho ou até 3 linhas acima contenham a UF
+  for i, h in enumerate(headers_norm):
+    if "ORIGEM" in h:
+      continue
+    if re.search(rf"\b{re.escape(uf)}\b", h):
+      return i
+    for offset in (1, 2, 3):
+      if header_idx - offset >= 0:
+        acima = normalizar_texto(df_raw.iloc[header_idx - offset, i])
+        if acima == uf or re.search(rf"\b{re.escape(uf)}\b", acima):
+          return i
+
+  # 3. Fallback: primeira coluna numérica de preço/custo (ignorando "ORIGEM")
+  for i, h in enumerate(headers_norm):
+    if "ORIGEM" in h:
+      continue
+    if "PRECO" in h or "CUSTO" in h or "VALOR" in h:
+      return i
+
+  return None
+
+
+def aba_corresponde_regime(aba_norm, desonerado):
+  # Abas padrão da Caixa: ISD (Insumo Sem Deson.), ICD (Insumo Com Deson.),
+  # CSD (Composição Sem Deson.), CCD (Composição Com Deson.)
+  if "ANALITICO" in aba_norm:
+    return False
+  if desonerado:
+    if aba_norm in ("ISD", "CSD") or "SEM DESONERACAO" in aba_norm:
+      return False
+  else:
+    if aba_norm in ("ICD", "CCD") or "COM DESONERACAO" in aba_norm:
+      return False
+  return True
+
+
+def extrair_abas_de_planilha(file_obj, uf, desonerado):
   excel_file = pd.ExcelFile(file_obj)
-  registros = []
+  print("  Abas encontradas:", excel_file.sheet_names)
+  resultados_por_aba = {}
 
   for aba in excel_file.sheet_names:
-    df_raw = excel_file.parse(aba, header=None)
+    aba_norm = normalizar_texto(aba)
+    if not aba_corresponde_regime(aba_norm, desonerado):
+      print(f"  Pulando aba '{aba}' (fora do regime selecionado).")
+      continue
+
+    df_raw = pd.read_excel(excel_file, sheet_name=aba, header=None)
     if df_raw.empty:
       continue
 
     header_idx = None
-    for idx, row in df_raw.iterrows():
-      linha_str = " ".join([normalizar_texto(x) for x in row.values])
+    max_scan = min(35, len(df_raw))
+    for idx in range(max_scan):
+      linha_str = " ".join([normalizar_texto(x) for x in df_raw.iloc[idx].values])
       if ("CODIGO" in linha_str or "COD" in linha_str) and (
           "DESCRICAO" in linha_str or "UNIDADE" in linha_str
       ):
@@ -206,47 +265,52 @@ def extrair_registros_de_planilha(file_obj, uf):
     if header_idx is None:
       continue
 
-    df = df_raw.iloc[header_idx + 1 :].copy()
-    df.columns = [normalizar_texto(c) for c in df_raw.iloc[header_idx]]
+    headers_norm = [normalizar_texto(c) for c in df_raw.iloc[header_idx].values]
 
-    col_cod = next(
-        (c for c in df.columns if "CODIGO" in c or c.startswith("COD")),
-        None,
-    )
-    col_desc = next((c for c in df.columns if "DESCRICAO" in c), None)
-    col_unid = next((c for c in df.columns if "UNIDADE" in c), None)
-
-    col_preco = next(
+    idx_cod = next(
         (
-            c
-            for c in df.columns
-            if uf in c and ("PRECO" in c or "CUSTO" in c or "R$" in c)
+            i
+            for i, h in enumerate(headers_norm)
+            if "CODIGO" in h or h.startswith("COD")
         ),
         None,
     )
-    if not col_preco:
-      col_preco = next(
-          (
-              c
-              for c in df.columns
-              if "PRECO" in c or "CUSTO" in c or "VALOR" in c
-          ),
-          None,
-      )
+    idx_desc = next(
+        (i for i, h in enumerate(headers_norm) if "DESCRICAO" in h), None
+    )
+    idx_unid = next(
+        (i for i, h in enumerate(headers_norm) if "UNIDADE" in h), None
+    )
+    idx_preco = encontrar_indice_preco(df_raw, header_idx, headers_norm, uf)
 
-    if not all([col_cod, col_desc, col_unid, col_preco]):
+    if any(x is None for x in (idx_cod, idx_desc, idx_unid, idx_preco)):
+      print(
+          f"  Aba '{aba}': colunas insuficientes "
+          f"(cod={idx_cod}, desc={idx_desc}, unid={idx_unid}, preco={idx_preco})."
+      )
       continue
 
-    sub = df[[col_cod, col_desc, col_unid, col_preco]].dropna(
-        subset=[col_cod, col_desc]
+    print(
+        f"  Extraindo aba '{aba}' -> cod[{idx_cod}], desc[{idx_desc}], "
+        f"unid[{idx_unid}], preco_{uf}[{idx_preco}] ({headers_norm[idx_preco]})"
     )
-    for _, r in sub.iterrows():
-      cod = re.sub(r"\.0$", "", str(r[col_cod])).strip()
+
+    df_dados = df_raw.iloc[header_idx + 1 :]
+    registros = []
+
+    for _, row in df_dados.iterrows():
+      cod_raw = row.iloc[idx_cod]
+      desc_raw = row.iloc[idx_desc]
+      if pd.isna(cod_raw) or pd.isna(desc_raw):
+        continue
+
+      cod = re.sub(r"\.0$", "", str(cod_raw)).strip()
       if not cod.isdigit():
         continue
-      desc = str(r[col_desc]).strip()
-      unid = str(r[col_unid]).strip().upper()
-      preco = limpar_valor(r[col_preco])
+
+      desc = str(desc_raw).strip()
+      unid = str(row.iloc[idx_unid]).strip().upper()
+      preco = limpar_valor(row.iloc[idx_preco])
 
       registros.append({
           "aba": aba,
@@ -257,7 +321,24 @@ def extrair_registros_de_planilha(file_obj, uf):
           "preco_unitario": preco,
       })
 
-  return registros
+    if registros:
+      resultados_por_aba[aba] = registros
+
+  return resultados_por_aba
+
+
+def definir_nome_arquivo_saida(nome_arq_xlsx, aba, uf, ano_mes, tipo_encargo):
+  aba_norm = normalizar_texto(aba)
+  if aba_norm in ("ISD", "ICD") or "INSUMO" in aba_norm:
+    return f"sinapi_insumos_{uf}_{ano_mes}_{tipo_encargo}.json"
+  if aba_norm in ("CSD", "CCD") or "COMPOSIC" in aba_norm:
+    return f"sinapi_composicoes_{uf}_{ano_mes}_{tipo_encargo}.json"
+
+  base_limpa = re.sub(
+      r"[^A-Za-z0-9_-]+", "_", os.path.splitext(os.path.basename(nome_arq_xlsx))[0]
+  )
+  aba_limpa = re.sub(r"[^A-Za-z0-9_-]+", "_", aba_norm)
+  return f"{base_limpa}_{aba_limpa}_{uf}.json"
 
 
 def processar_e_enviar():
@@ -269,12 +350,12 @@ def processar_e_enviar():
   if not folder_id:
     raise RuntimeError("Variável GDRIVE_SINAPI_FOLDER_ID não configurada.")
 
+  tipo_encargo = "Desonerado" if desonerado else "NaoDesonerado"
   drive_service = obter_servico_drive()
 
   try:
     conteudo_zip = localizar_e_baixar_zip(drive_service, folder_id, ano_mes)
   except FileNotFoundError:
-    tipo_encargo = "Desonerado" if desonerado else "NaoDesonerado"
     url = (
         f"https://www.caixa.gov.br/Downloads/sinapi-a-partir-jul-2009-{uf.lower()}/"
         f"SINAPI_ref_Insumos_Composicoes_{uf}_{ano_mes}_{tipo_encargo}.zip"
@@ -292,24 +373,25 @@ def processar_e_enviar():
 
       print(f"Lendo planilha dentro do ZIP: {nome_arq}")
       with z.open(nome_arq) as f:
-        dados = extrair_registros_de_planilha(io.BytesIO(f.read()), uf)
+        abas_extraidas = extrair_abas_de_planilha(
+            io.BytesIO(f.read()), uf, desonerado
+        )
 
-      if not dados:
+      if not abas_extraidas:
         print(f"Sem registros tabulares padrão em {nome_arq}, pulando.")
         continue
 
-      base_limpa = re.sub(
-          r"[^A-Za-z0-9_-]+",
-          "_",
-          os.path.splitext(os.path.basename(nome_arq))[0],
-      )
-      caminho_json = os.path.join(pasta_tmp, f"{base_limpa}_{uf}.json")
+      for aba, dados in abas_extraidas.items():
+        nome_json = definir_nome_arquivo_saida(
+            nome_arq, aba, uf, ano_mes, tipo_encargo
+        )
+        caminho_json = os.path.join(pasta_tmp, nome_json)
 
-      with open(caminho_json, "w", encoding="utf-8") as jf:
-        json.dump(dados, jf, ensure_ascii=False, indent=2)
+        with open(caminho_json, "w", encoding="utf-8") as jf:
+          json.dump(dados, jf, ensure_ascii=False, indent=2)
 
-      print(f"Gerado {os.path.basename(caminho_json)} com {len(dados)} itens.")
-      enviar_ou_atualizar_drive(drive_service, caminho_json, folder_id)
+        print(f"Gerado {nome_json} com {len(dados)} itens.")
+        enviar_ou_atualizar_drive(drive_service, caminho_json, folder_id)
 
 
 if __name__ == "__main__":
