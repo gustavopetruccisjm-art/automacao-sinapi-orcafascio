@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 import zipfile
 
@@ -9,6 +10,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import pandas as pd
+import requests
 
 
 def normalizar_texto(texto):
@@ -53,46 +55,83 @@ def localizar_e_baixar_zip(service, folder_id, ano_mes):
   mes = ano_mes[4:6]
   nome_padrao = f"SINAPI-{ano}-{mes}-formato-xlsx.zip"
 
-  query = (
-      f"'{folder_id}' in parents and mimeType = 'application/zip' "
-      "and trashed = false"
-  )
+  query = f"'{folder_id}' in parents and trashed = false"
   res = (
       service.files()
-      .list(q=query, fields="files(id, name)", pageSize=50)
+      .list(
+          q=query,
+          fields="files(id, name, mimeType)",
+          pageSize=50,
+          supportsAllDrives=True,
+          includeItemsFromAllDrives=True,
+      )
       .execute()
   )
-  arquivos = res.get("files", [])
+
+  todos_arquivos = res.get("files", [])
+  print("Arquivos encontrados na pasta do Drive:", [a["name"] for a in todos_arquivos])
+
+  arquivos_zip = [
+      a for a in todos_arquivos if str(a.get("name", "")).lower().endswith(".zip")
+  ]
 
   escolhido = None
-  for arq in arquivos:
+  for arq in arquivos_zip:
     if arq["name"] == nome_padrao:
       escolhido = arq
       break
 
-  if not escolhido and arquivos:
-    for arq in arquivos:
-      if f"{ano}-{mes}" in arq["name"] or f"{ano}_{mes}" in arq["name"] or ano_mes in arq["name"]:
+  if not escolhido and arquivos_zip:
+    for arq in arquivos_zip:
+      if (
+          f"{ano}-{mes}" in arq["name"]
+          or f"{ano}_{mes}" in arq["name"]
+          or ano_mes in arq["name"]
+      ):
         escolhido = arq
         break
 
-  if not escolhido and arquivos:
-    escolhido = arquivos[0]
+  if not escolhido and arquivos_zip:
+    escolhido = arquivos_zip[0]
 
   if not escolhido:
     raise FileNotFoundError(
-        f"Nenhum arquivo .zip encontrado na pasta do Drive (esperado algo como {nome_padrao}). "
-        "Envie o .zip para a pasta 01_BASE_SINAPI_JSON antes de rodar."
+        f"Nenhum arquivo .zip encontrado na pasta do Drive (esperado algo"
+        f" como {nome_padrao}). Envie o .zip para a pasta 01_BASE_SINAPI_JSON"
+        " antes de rodar."
     )
 
   print(f"ZIP localizado no Drive: {escolhido['name']}")
-  request = service.files().get_media(fileId=escolhido["id"])
+  request = service.files().get_media(
+      fileId=escolhido["id"], supportsAllDrives=True
+  )
   buffer = io.BytesIO()
   downloader = MediaIoBaseDownload(buffer, request)
   done = False
   while not done:
     _, done = downloader.next_chunk()
   return buffer.getvalue()
+
+
+def baixar_zip_caixa(url, tentativas=2, espera_inicial=3):
+  session = requests.Session()
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      ),
+      "Accept": "application/octet-stream,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9",
+      "Referer": "https://www.caixa.gov.br/",
+  }
+  for tentativa in range(1, tentativas + 1):
+    resp = session.get(url, headers=headers, timeout=60)
+    if resp.status_code == 200:
+      return resp.content
+    if resp.status_code in (429, 500, 502, 503, 504) and tentativa < tentativas:
+      time.sleep(espera_inicial * tentativa)
+      continue
+    resp.raise_for_status()
 
 
 def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
@@ -107,7 +146,13 @@ def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
   )
   res = (
       service.files()
-      .list(q=query, fields="files(id, name)", pageSize=10)
+      .list(
+          q=query,
+          fields="files(id, name)",
+          pageSize=10,
+          supportsAllDrives=True,
+          includeItemsFromAllDrives=True,
+      )
       .execute()
   )
   arquivos = res.get("files", [])
@@ -116,7 +161,12 @@ def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
     file_id = arquivos[0]["id"]
     atualizado = (
         service.files()
-        .update(fileId=file_id, media_body=media, fields="id, name")
+        .update(
+            fileId=file_id,
+            media_body=media,
+            fields="id, name",
+            supportsAllDrives=True,
+        )
         .execute()
     )
     print(f"Atualizado no Drive: {atualizado['name']}")
@@ -124,7 +174,12 @@ def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
     metadata = {"name": nome_arquivo, "parents": [folder_id]}
     criado = (
         service.files()
-        .create(body=metadata, media_body=media, fields="id, name")
+        .create(
+            body=metadata,
+            media_body=media,
+            fields="id, name",
+            supportsAllDrives=True,
+        )
         .execute()
     )
     print(f"Enviado para o Drive: {criado['name']}")
@@ -155,26 +210,27 @@ def extrair_registros_de_planilha(file_obj, uf):
     df.columns = [normalizar_texto(c) for c in df_raw.iloc[header_idx]]
 
     col_cod = next(
+        (c for c in df.columns if "CODIGO" in c or c.startswith("COD")),
+        None,
+    )
+    col_desc = next((c for c in df.columns if "DESCRICAO" in c), None)
+    col_unid = next((c for c in df.columns if "UNIDADE" in c), None)
+
+    col_preco = next(
         (
             c
             for c in df.columns
-            if "CODIGO" in c or c.startswith("COD")
+            if uf in c and ("PRECO" in c or "CUSTO" in c or "R$" in c)
         ),
-        None,
-    )
-    col_desc = next(
-        (c for c in df.columns if "DESCRICAO" in c), None
-    )
-    col_unid = next((c for c in df.columns if "UNIDADE" in c), None)
-
-    # Procura coluna de preço da UF ou genérica
-    col_preco = next(
-        (c for c in df.columns if uf in c and ("PRECO" in c or "CUSTO" in c or "R$" in c)),
         None,
     )
     if not col_preco:
       col_preco = next(
-          (c for c in df.columns if "PRECO" in c or "CUSTO" in c or "VALOR" in c),
+          (
+              c
+              for c in df.columns
+              if "PRECO" in c or "CUSTO" in c or "VALOR" in c
+          ),
           None,
       )
 
@@ -207,13 +263,24 @@ def extrair_registros_de_planilha(file_obj, uf):
 def processar_e_enviar():
   uf = os.environ.get("UF", "RJ").strip().upper()
   ano_mes = os.environ.get("ANO_MES", "202610").strip()
-  folder_id = os.environ.get("GDRIVE_SINAPI_FOLDER_ID")
+  desonerado = os.environ.get("DESONERADO", "false").strip().lower() == "true"
+  folder_id = os.environ.get("GDRIVE_SINAPI_FOLDER_ID", "").strip()
 
   if not folder_id:
     raise RuntimeError("Variável GDRIVE_SINAPI_FOLDER_ID não configurada.")
 
   drive_service = obter_servico_drive()
-  conteudo_zip = localizar_e_baixar_zip(drive_service, folder_id, ano_mes)
+
+  try:
+    conteudo_zip = localizar_e_baixar_zip(drive_service, folder_id, ano_mes)
+  except FileNotFoundError:
+    tipo_encargo = "Desonerado" if desonerado else "NaoDesonerado"
+    url = (
+        f"https://www.caixa.gov.br/Downloads/sinapi-a-partir-jul-2009-{uf.lower()}/"
+        f"SINAPI_ref_Insumos_Composicoes_{uf}_{ano_mes}_{tipo_encargo}.zip"
+    )
+    print("ZIP não encontrado no Drive. Tentando download direto da Caixa...")
+    conteudo_zip = baixar_zip_caixa(url)
 
   pasta_tmp = "./tmp_sinapi"
   os.makedirs(pasta_tmp, exist_ok=True)
@@ -231,7 +298,11 @@ def processar_e_enviar():
         print(f"Sem registros tabulares padrão em {nome_arq}, pulando.")
         continue
 
-      base_limpa = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(os.path.basename(nome_arq))[0])
+      base_limpa = re.sub(
+          r"[^A-Za-z0-9_-]+",
+          "_",
+          os.path.splitext(os.path.basename(nome_arq))[0],
+      )
       caminho_json = os.path.join(pasta_tmp, f"{base_limpa}_{uf}.json")
 
       with open(caminho_json, "w", encoding="utf-8") as jf:
