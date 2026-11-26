@@ -8,7 +8,7 @@ import zipfile
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import pandas as pd
 import requests
 
@@ -37,41 +37,6 @@ def limpar_valor(val):
     return 0.0
 
 
-def baixar_zip_com_retry(url, tentativas=4, espera_inicial=5):
-  session = requests.Session()
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-      ),
-      "Accept": (
-          "text/html,application/xhtml+xml,application/xml;q=0.9,"
-          "application/octet-stream,*/*;q=0.8"
-      ),
-      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Referer": "https://www.caixa.gov.br/",
-      "Connection": "keep-alive",
-  }
-
-  for tentativa in range(1, tentativas + 1):
-    resp = session.get(url, headers=headers, timeout=90)
-    if resp.status_code == 200:
-      return resp.content
-
-    if resp.status_code in (429, 500, 502, 503, 504):
-      espera = espera_inicial * tentativa
-      print(
-          f"Aviso: HTTP {resp.status_code} na tentativa "
-          f"{tentativa}/{tentativas}. Aguardando {espera}s..."
-      )
-      time.sleep(espera)
-      continue
-
-    resp.raise_for_status()
-
-  resp.raise_for_status()
-
-
 def obter_servico_drive():
   cred_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
   if not cred_json:
@@ -80,9 +45,55 @@ def obter_servico_drive():
     )
   info = json.loads(cred_json)
   creds = service_account.Credentials.from_service_account_info(
-      info, scopes=["https://www.googleapis.com/auth/drive.file"]
+      info, scopes=["https://www.googleapis.com/auth/drive"]
   )
   return build("drive", "v3", credentials=creds)
+
+
+def buscar_zip_no_drive(service, folder_id, nome_zip):
+  query = (
+      f"name = '{nome_zip}' and '{folder_id}' in parents "
+      "and trashed = false"
+  )
+  res = (
+      service.files()
+      .list(q=query, fields="files(id, name)", pageSize=10)
+      .execute()
+  )
+  arquivos = res.get("files", [])
+  if not arquivos:
+    return None
+
+  file_id = arquivos[0]["id"]
+  print(f"Arquivo {nome_zip} encontrado no Google Drive. Baixando para processamento...")
+  request = service.files().get_media(fileId=file_id)
+  buffer = io.BytesIO()
+  downloader = MediaIoBaseDownload(buffer, request)
+  done = False
+  while not done:
+    _, done = downloader.next_chunk()
+  return buffer.getvalue()
+
+
+def baixar_zip_caixa(url, tentativas=2, espera_inicial=3):
+  session = requests.Session()
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      ),
+      "Accept": "application/octet-stream,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9",
+      "Referer": "https://www.caixa.gov.br/",
+  }
+  for tentativa in range(1, tentativas + 1):
+    resp = session.get(url, headers=headers, timeout=60)
+    if resp.status_code == 200:
+      return resp.content
+    if resp.status_code in (429, 500, 502, 503, 504) and tentativa < tentativas:
+      time.sleep(espera_inicial * tentativa)
+      continue
+    resp.raise_for_status()
 
 
 def enviar_ou_atualizar_drive(service, caminho_local, folder_id):
@@ -124,23 +135,27 @@ def processar_e_enviar():
   uf = os.environ.get("UF", "RJ").strip().upper()
   ano_mes = os.environ.get("ANO_MES", "202610").strip()
   desonerado = os.environ.get("DESONERADO", "false").strip().lower() == "true"
-  folder_id = os.environ.get("DRIVE_FOLDER_ID")
+  folder_id = os.environ.get("GDRIVE_SINAPI_FOLDER_ID")
 
   if not folder_id:
-    raise RuntimeError("Variável DRIVE_FOLDER_ID não configurada.")
+    raise RuntimeError("Variável GDRIVE_SINAPI_FOLDER_ID não configurada.")
 
   tipo_encargo = "Desonerado" if desonerado else "NaoDesonerado"
+  nome_zip = f"SINAPI_ref_Insumos_Composicoes_{uf}_{ano_mes}_{tipo_encargo}.zip"
   url = (
       f"https://www.caixa.gov.br/Downloads/sinapi-a-partir-jul-2009-{uf.lower()}/"
-      f"SINAPI_ref_Insumos_Composicoes_{uf}_{ano_mes}_{tipo_encargo}.zip"
+      f"{nome_zip}"
   )
 
-  print(f"Baixando SINAPI {uf} | {ano_mes} | {tipo_encargo}...")
-  conteudo_zip = baixar_zip_com_retry(url)
+  drive_service = obter_servico_drive()
+  conteudo_zip = buscar_zip_no_drive(drive_service, folder_id, nome_zip)
+
+  if conteudo_zip is None:
+    print(f"ZIP não encontrado no Drive. Tentando download direto da Caixa...")
+    conteudo_zip = baixar_zip_caixa(url)
 
   pasta_tmp = "./tmp_sinapi"
   os.makedirs(pasta_tmp, exist_ok=True)
-  drive_service = obter_servico_drive()
 
   with zipfile.ZipFile(io.BytesIO(conteudo_zip)) as z:
     for nome_arq in z.namelist():
@@ -181,9 +196,7 @@ def processar_e_enviar():
           ),
           None,
       )
-      col_desc = next(
-          (c for c in df.columns if "DESCRICAO" in c), None
-      )
+      col_desc = next((c for c in df.columns if "DESCRICAO" in c), None)
       col_unid = next((c for c in df.columns if "UNIDADE" in c), None)
       col_preco = next(
           (c for c in df.columns if "PRECO" in c or "CUSTO" in c), None
