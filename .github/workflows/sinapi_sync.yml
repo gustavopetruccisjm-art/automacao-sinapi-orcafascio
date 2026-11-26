@@ -37,7 +37,7 @@ jobs:
       - name: Executar coleta SINAPI e upload para o Drive
         env:
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          DRIVE_FOLDER_ID: "1iZ_BXKBKCQHRqxVGIC5PbaReQWEAvUb2"
+          GDRIVE_SINAPI_FOLDER_ID: ${{ secrets.GDRIVE_SINAPI_FOLDER_ID }}
           UF: ${{ github.event.inputs.uf || 'RJ' }}
           ANO_MES: ${{ github.event.inputs.ano_mes || '202610' }}
           DESONERADO: ${{ github.event.inputs.desonerado || 'false' }}
