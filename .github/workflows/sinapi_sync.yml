@@ -1,0 +1,44 @@
+name: Coleta e Processamento SINAPI -> Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      uf:
+        description: "UF da tabela SINAPI (ex: RJ)"
+        required: true
+        default: "RJ"
+      ano_mes:
+        description: "Competência AAAAMM (ex: 202610)"
+        required: true
+        default: "202610"
+      desonerado:
+        description: "Usar base desonerada? (true/false)"
+        required: true
+        default: "false"
+  schedule:
+    - cron: "0 8 10 * *"
+
+jobs:
+  sync-sinapi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          pip install pandas openpyxl requests google-api-python-client google-auth
+
+      - name: Executar coleta SINAPI e upload para o Drive
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: "1iZ_BXKBKCQHRqxVGIC5PbaReQWEAvUb2"
+          UF: ${{ github.event.inputs.uf || 'RJ' }}
+          ANO_MES: ${{ github.event.inputs.ano_mes || '202610' }}
+          DESONERADO: ${{ github.event.inputs.desonerado || 'false' }}
+        run: python scripts/coletar_sinapi_drive.py
