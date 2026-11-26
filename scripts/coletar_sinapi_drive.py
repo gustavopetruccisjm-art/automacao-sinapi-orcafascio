@@ -232,15 +232,11 @@ def encontrar_indice_preco(df_raw, header_idx, headers_norm, uf):
 
 
 def aba_corresponde_regime(aba_norm, desonerado):
-  if "ANALITICO" in aba_norm:
-    return False
-  if desonerado:
-    if aba_norm in ("ISD", "CSD") or "SEM DESONERACAO" in aba_norm:
-      return False
-  else:
-    if aba_norm in ("ICD", "CCD") or "COM DESONERACAO" in aba_norm:
-      return False
-  return True
+  # Processa exclusivamente Insumos e Composições do regime escolhido:
+  # - Não Desonerado: ISD e CSD
+  # - Desonerado: ICD e CCD
+  abas_alvo = {"ICD", "CCD"} if desonerado else {"ISD", "CSD"}
+  return aba_norm in abas_alvo
 
 
 def extrair_abas_de_planilha(file_obj, uf, desonerado):
@@ -251,7 +247,7 @@ def extrair_abas_de_planilha(file_obj, uf, desonerado):
   for aba in excel_file.sheet_names:
     aba_norm = normalizar_texto(aba)
     if not aba_corresponde_regime(aba_norm, desonerado):
-      print(f"  Pulando aba '{aba}' (fora do regime selecionado).")
+      print(f"  Pulando aba '{aba}'.")
       continue
 
     df_raw = pd.read_excel(excel_file, sheet_name=aba, header=None)
@@ -335,9 +331,9 @@ def extrair_abas_de_planilha(file_obj, uf, desonerado):
 
 def definir_nome_arquivo_saida(nome_arq_xlsx, aba, uf, ano_mes, tipo_encargo):
   aba_norm = normalizar_texto(aba)
-  if aba_norm in ("ISD", "ICD") or "INSUMO" in aba_norm:
+  if aba_norm in ("ISD", "ICD"):
     return f"sinapi_insumos_{uf}_{ano_mes}_{tipo_encargo}.json"
-  if aba_norm in ("CSD", "CCD") or "COMPOSIC" in aba_norm:
+  if aba_norm in ("CSD", "CCD"):
     return f"sinapi_composicoes_{uf}_{ano_mes}_{tipo_encargo}.json"
 
   base_limpa = re.sub(
@@ -377,7 +373,6 @@ def processar_e_enviar():
       if not nome_arq.endswith((".xlsx", ".xls")):
         continue
 
-      # Foca apenas na planilha SINAPI_Referência (preços de insumos e composições)
       if "REFER" not in normalizar_texto(nome_arq):
         print(f"Ignorando planilha auxiliar: {nome_arq}")
         continue
