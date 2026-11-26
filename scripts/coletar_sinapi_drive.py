@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 import zipfile
 
@@ -34,6 +35,41 @@ def limpar_valor(val):
     return float(s)
   except ValueError:
     return 0.0
+
+
+def baixar_zip_com_retry(url, tentativas=4, espera_inicial=5):
+  session = requests.Session()
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      ),
+      "Accept": (
+          "text/html,application/xhtml+xml,application/xml;q=0.9,"
+          "application/octet-stream,*/*;q=0.8"
+      ),
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Referer": "https://www.caixa.gov.br/",
+      "Connection": "keep-alive",
+  }
+
+  for tentativa in range(1, tentativas + 1):
+    resp = session.get(url, headers=headers, timeout=90)
+    if resp.status_code == 200:
+      return resp.content
+
+    if resp.status_code in (429, 500, 502, 503, 504):
+      espera = espera_inicial * tentativa
+      print(
+          f"Aviso: HTTP {resp.status_code} na tentativa "
+          f"{tentativa}/{tentativas}. Aguardando {espera}s..."
+      )
+      time.sleep(espera)
+      continue
+
+    resp.raise_for_status()
+
+  resp.raise_for_status()
 
 
 def obter_servico_drive():
@@ -100,14 +136,13 @@ def processar_e_enviar():
   )
 
   print(f"Baixando SINAPI {uf} | {ano_mes} | {tipo_encargo}...")
-  resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=90)
-  resp.raise_for_status()
+  conteudo_zip = baixar_zip_com_retry(url)
 
   pasta_tmp = "./tmp_sinapi"
   os.makedirs(pasta_tmp, exist_ok=True)
   drive_service = obter_servico_drive()
 
-  with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+  with zipfile.ZipFile(io.BytesIO(conteudo_zip)) as z:
     for nome_arq in z.namelist():
       if not nome_arq.endswith((".xlsx", ".xls")):
         continue
